@@ -40,6 +40,34 @@ void MsToDayTime(uint32_t uTimeMs, SYSTEMTIME &st) {
 	st.wHour         = uTimeMs % 24;
 }
 
+std::string FormatDayTime(uint32_t uTimeMs) {
+	char sz[0x10+1] = { 0 };
+	SYSTEMTIME tt = { 0 };
+	MsToDayTime(uTimeMs, tt);
+	::StringCbPrintfA(sz, 0x10, "%02d:%02d:%02d", tt.wHour, tt.wMinute, tt.wSecond);
+	return sz;
+}
+
+
+#if _DEBUG
+void LogDebugString(const char *szFormat, ...) { //!!! not used
+	va_list args;
+	va_start(args, szFormat);
+	va_list args2;
+	va_copy(args2, args);
+	int iSize = std::vsnprintf(nullptr, 0, szFormat, args);
+	va_end(args);
+	std::vector<char> buf(iSize + 2); // '\n' '\0'
+	std::vsnprintf(buf.data(), buf.size(), szFormat, args2);
+	va_end(args2);
+	buf[iSize] = '\n';
+	::OutputDebugStringA(buf.data());
+}
+#define TRACE_DEBUG LogDebugString
+#else
+#define TRACE_DEBUG
+#endif
+
 #pragma endregion Utils
 
 //-----------------------------------------------------------------------
@@ -83,6 +111,10 @@ const std::wstring c_sConfigFile = c_sAppDir + L"\\TrayTimeTracker_config.ini";
 
 struct SConfig
 {
+	uint32_t uVersion = 0; // positive when initialized
+
+	uint32_t uDebugMode = 0;
+
 	uint32_t uTimerElapseMs = 15000;
 
 	// Limits
@@ -91,7 +123,7 @@ struct SConfig
 
 	struct STask {
 		uint32_t uId = 0; // positive; 0 for unset
-		std::string sId; // e.g. "youtube" - plain!?
+		std::string sKey; // e.g. "youtube" - plain!?
 		std::wstring sProcessName; // e.g. "chrome.exe"
 		std::wstring sWindowTitlePart; // optional; e.g. "YouTube"
 		std::string sClosingCode; // e.g. "alt+f4"; !!! not used
@@ -101,8 +133,14 @@ struct SConfig
 
 SConfig g_config;
 
-void ReadConfig()
+bool ReadConfig()
 {	
+	g_config.uVersion             = ::GetPrivateProfileIntW(L"Main", L"configVersion", 0, c_sConfigFile.c_str());
+	if (g_config.uVersion == 0) return false; // config file is missing or invalid
+	if (g_config.uVersion > 1) return false; // unsupported version
+
+	g_config.uDebugMode           = ::GetPrivateProfileIntW(L"Main", L"debugMode", 0, c_sConfigFile.c_str());
+
 	g_config.uTimerElapseMs       = ::GetPrivateProfileIntW(L"Main", L"timerMs", g_config.uTimerElapseMs, c_sConfigFile.c_str());
 	
 	// Limits
@@ -129,6 +167,12 @@ void ReadConfig()
 			}
 		);
 	}
+
+	return true;
+}
+
+std::string GetTaskKey(uint32_t uTaskId) {
+	return uTaskId == 0 ? "" : g_config.tasks[uTaskId-1].sKey;
 }
 
 #pragma endregion Config
@@ -183,6 +227,10 @@ public:
 		uint64_t uSystemTicks = ::GetTickCount64();
 		uTimeMs = (uint32_t)(uSystemTicks - _iMidnightTicks);
 
+		if (uTimeMs - _uPrevCheckTimeMs > g_config.uTimerElapseMs * 20) { // long delay, probably PC was sleeping - forget the previous task
+			_uPrevTaskId = 0;
+		}
+
 		// Check next day coming
 		if (uTimeMs >= c_uOneDayMs)
 		{
@@ -208,6 +256,10 @@ public:
 
 		// Switch task
 		if (_uPrevTaskId != uCurrentTaskId) {
+			if (g_config.uDebugMode) { //!!! debug
+				FlushHistory(false);
+				WriteDataToHistory(FormatDayTime(uTimeMs) + " Switching task: " + GetTaskKey(uCurrentTaskId) + " <- " + GetTaskKey(_uPrevTaskId) + "\n");
+			}
 			// add history record
 			if (_uPrevTaskId != 0) {
 				_history.push_back(SRecord{ _uPrevTaskId, _uPrevTaskStartMs, uTimeMs });
@@ -222,11 +274,11 @@ public:
 		return _uTotalScreenTimeMs;
 	}
 
-	std::string GetStats() { // Short statistics for info window
+	std::wstring GetStats() { // Short statistics for info window
 		SYSTEMTIME st; MsToDayTime(_uTotalScreenTimeMs, st);
-		char szTime[0x20+1] = { 0 };
-		::StringCbPrintfA(szTime, 0x20, "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
-		return "Screen time today: " + std::string(szTime);
+		WCHAR szTime[0x20+1] = { 0 };
+		::StringCbPrintfW(szTime, 0x20, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+		return L"Screen time today: " + std::wstring(szTime);
 	}
 
 	void SaveState() { // Save today's screen time e.g. on reboot
@@ -244,7 +296,7 @@ public:
 		}
 	}
 
-	void FlushHistory() { // Write (or append) the history records to \history\<date>.txt
+	void FlushHistory(bool bAddTotalScreenTime = true) { // Write (or append) the history records to \history\<date>.txt
 		if (_history.empty()) return;
 
 		std::string sData;
@@ -261,18 +313,23 @@ public:
 				t0.wHour, t0.wMinute, t0.wSecond,
 				t1.wHour, t1.wMinute, t1.wSecond,
 				td.wHour, td.wMinute, td.wSecond,
-				g_config.tasks[r.uTaskId-1].sId.c_str()
+				GetTaskKey(r.uTaskId).c_str()
 			);
 			sData += szLine;
 		}
 
+		_history.clear();
+
 		// Add total screen time
-		SYSTEMTIME tt = { 0 };
-		MsToDayTime(_uTotalScreenTimeMs, tt);
-		::StringCbPrintfA(szLine, 0x200, "Total screen time: %02d:%02d:%02d\n", tt.wHour, tt.wMinute, tt.wSecond);
-		sData += szLine;
+		if (bAddTotalScreenTime) {
+			sData += "Total screen time: " + FormatDayTime(_uTotalScreenTimeMs) + "\n";
+		}
 
 		// Write (append) to history file
+		WriteDataToHistory(sData);
+	}
+
+	void WriteDataToHistory(const std::string &sData) {		
 		std::wstring sPath = c_sAppDir + L"\\history";
 		if (::GetFileAttributesW(sPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
 			::CreateDirectoryW(sPath.c_str(), NULL);
@@ -284,8 +341,6 @@ public:
 			::WriteFile(hFile, sData.c_str(), (DWORD)sData.length(), &dwBytesWritten, NULL);
 			::CloseHandle(hFile);
 		}
-
-		_history.clear();
 	}
 
 };
@@ -302,6 +357,8 @@ bool GetForegroundWindowProcess(HWND &hWnd, std::wstring &sProcessName) {
 	hWnd = ::GetForegroundWindow();
 	if (!hWnd) return false;
 
+	if (::IsIconic(hWnd)) return false;
+
 	static HWND s_hWndPrev = NULL; // Cache previous values
 	static std::wstring s_sProcessNamePrev;
 	if (hWnd == s_hWndPrev) {
@@ -316,28 +373,11 @@ bool GetForegroundWindowProcess(HWND &hWnd, std::wstring &sProcessName) {
 	DWORD dwThreadID = ::GetWindowThreadProcessId(hWnd, &dwPID);
 	if (!dwThreadID) return false;
 
-	//!!! cache process name
 	HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, dwPID);
 	if (!hProcess) return false;
 
-#if 0
-	typedef BOOL(__stdcall *TGetProcessImageFileName)(HANDLE, WCHAR *, DWORD);
-	static TGetProcessImageFileName s_pGetProcessImageFileName = nullptr;
-	if (!s_pGetProcessImageFileName) {
-		HMODULE hModule = ::GetModuleHandleW(L"kernel32.dll");
-		if (hModule) {
-			FARPROC pProc = ::GetProcAddress(hModule, "K32GetProcessImageFileNameW");
-			if (pProc) s_pGetProcessImageFileName = (TGetProcessImageFileName)pProc;
-		}
-		if (!s_pGetProcessImageFileName) return false; //!!! remember
-	}
-
-	WCHAR szProcessPath[MAX_PATH];
-	BOOL bResult = s_pGetProcessImageFileName(hProcess, (LPWSTR)&szProcessPath, MAX_PATH - 1);
-#else
 	WCHAR szProcessPath[MAX_PATH];
 	BOOL bResult = ::GetProcessImageFileNameW(hProcess, (LPWSTR)&szProcessPath, MAX_PATH - 1);
-#endif
 
 	::CloseHandle(hProcess);
 
@@ -363,7 +403,17 @@ uint32_t GetCurrentTaskId(const std::vector<SConfig::STask> &tasks) {
 	//!!! this probably should return all non-minimized windows (EnumWindows), not only the active one
 	HWND hWnd = 0;
 	std::wstring sProcessName;
-	if (GetForegroundWindowProcess(hWnd, sProcessName)) {
+	if (GetForegroundWindowProcess(hWnd, sProcessName))
+	{
+		if (g_config.uDebugMode) { //!!! debug
+			std::wstring sTitle;
+			if (hWnd) ::GetWindowTitle(hWnd, sTitle);
+			SYSTEMTIME st; ::GetLocalTime(&st);
+			uint32_t uTodayMs = DayTimeToMs(st);
+			g_tracker.FlushHistory(false);
+			g_tracker.WriteDataToHistory(FormatDayTime(uTodayMs) + " Current process " + ConvertString16to8(sProcessName) + "; title: " + ConvertString16to8(sTitle) + "\n");
+		}
+
 		for (const SConfig::STask &task : tasks) {
 			if (task.sProcessName == sProcessName) {
 				if (task.sWindowTitlePart.empty()) {
@@ -397,12 +447,20 @@ void ProcessTimer()
 		// Today's screen time limit
 		if (g_config.uScreenTimeLimitMs != 0 && uTotalScreenTimeMs > g_config.uScreenTimeLimitMs) {
 			ShowNotification(L"Today's screen time limit is reached!");
+			if (g_config.uDebugMode) {
+				g_tracker.FlushHistory(false);
+				g_tracker.WriteDataToHistory(FormatDayTime(uTimeMs) + ": Today's screen time limit is reached!\n");
+			}
 			//!!! close the window?
 		}
 
 		// Evening shutdown
 		else if (g_config.uShutdownTimeMs != 0 && uTimeMs >= g_config.uShutdownTimeMs) {
 			ShowNotification(L"It's evening screen time shutdown!");
+			if (g_config.uDebugMode) {
+				g_tracker.FlushHistory(false);
+				g_tracker.WriteDataToHistory(FormatDayTime(uTimeMs) + ": It's evening screen time shutdown!\n");
+			}
 			//!!! close the window?
 		}
 	}
@@ -418,8 +476,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (LOWORD(lParam) == WM_LBUTTONUP) {
 			g_tracker.SaveState();
 			g_tracker.FlushHistory(); // Flush history at the same time
-			std::string sStats = g_tracker.GetStats();
-			::MessageBoxA(hWnd, sStats.c_str(), "TrayTimeTracker", MB_ICONINFORMATION);
+			std::wstring sStats = g_tracker.GetStats();
+			ShowNotification(sStats);
 		}
 #if _DEBUG
 		else if (LOWORD(lParam) == WM_RBUTTONUP) { // close by r-click in debug
@@ -471,7 +529,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	if (hwnd == NULL) return 1;
 
 	CreateTrayIcon(hwnd);
-	ReadConfig();
+
+	if (!ReadConfig()) {
+		ShowNotification(L"Invalid or missing configuration");
+	}
+
 	g_tracker.ResetMidnight();
 	g_tracker.LoadState();
 

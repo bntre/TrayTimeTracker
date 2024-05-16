@@ -1,7 +1,7 @@
 # TrayTimeTracker
 
-lightweight screen time tracker for Windows written in c++. 
-being made for kids in reactive development mode. 
+lightweight screen time tracker for Windows written in c++.  
+being made for kids in reactive development mode.  
 may be offered as a quest and a contest between the developer/administrator and young gamers.
 
 Features:
