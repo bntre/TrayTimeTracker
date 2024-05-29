@@ -3,6 +3,7 @@
 #include <tchar.h>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <psapi.h>
 #include <strsafe.h>
 #include <codecvt>
@@ -171,8 +172,9 @@ bool ReadConfig()
 	return true;
 }
 
-std::string GetTaskKey(uint32_t uTaskId) {
-	return uTaskId == 0 ? "" : g_config.tasks[uTaskId-1].sKey;
+const SConfig::STask &GetTask(uint32_t uTaskId) {
+	static SConfig::STask s_default;
+	return uTaskId == 0 ? s_default : g_config.tasks[uTaskId - 1];
 }
 
 #pragma endregion Config
@@ -258,7 +260,7 @@ public:
 		if (_uPrevTaskId != uCurrentTaskId) {
 			if (g_config.uDebugMode) { //!!! debug
 				FlushHistory(false);
-				WriteDataToHistory(FormatDayTime(uTimeMs) + " Switching task: " + GetTaskKey(uCurrentTaskId) + " <- " + GetTaskKey(_uPrevTaskId) + "\n");
+				WriteDataToHistory(FormatDayTime(uTimeMs) + " Switching task: " + GetTask(uCurrentTaskId).sKey + " <- " + GetTask(_uPrevTaskId).sKey + "\n");
 			}
 			// add history record
 			if (_uPrevTaskId != 0) {
@@ -313,7 +315,7 @@ public:
 				t0.wHour, t0.wMinute, t0.wSecond,
 				t1.wHour, t1.wMinute, t1.wSecond,
 				td.wHour, td.wMinute, td.wSecond,
-				GetTaskKey(r.uTaskId).c_str()
+				GetTask(r.uTaskId).sKey.c_str()
 			);
 			sData += szLine;
 		}
@@ -399,7 +401,41 @@ bool GetWindowTitle(HWND hWnd, std::wstring &sTitle) {
 	return true;
 }
 
-uint32_t GetCurrentTaskId(const std::vector<SConfig::STask> &tasks) {
+bool SendKeyCombinationInput(WORD wVk0, WORD wVk1) {
+	INPUT inputs[4] = { 0 };
+	inputs[0].type = INPUT_KEYBOARD; inputs[0].ki.wVk = wVk0;
+	inputs[1].type = INPUT_KEYBOARD; inputs[1].ki.wVk = wVk1;
+	inputs[2].type = INPUT_KEYBOARD; inputs[2].ki.wVk = wVk1; inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+	inputs[3].type = INPUT_KEYBOARD; inputs[3].ki.wVk = wVk0; inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+	UINT uSent = ::SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+	return uSent == ARRAYSIZE(inputs);
+}
+
+struct SKeyCombination {
+	WORD wVk0 = 0;
+	WORD wVk1 = 1;
+};
+const std::unordered_map<std::string, SKeyCombination> g_closingCodes = {
+	{ "alt+f4",     SKeyCombination { VK_MENU, VK_F4 } },     // close the window
+	{ "ctrl+w",     SKeyCombination { VK_CONTROL, 'W' } },    // close the tab
+	{ "win+down",   SKeyCombination { VK_LWIN, VK_DOWN } },   // minimize the window
+	{ "win+d",      SKeyCombination { VK_LWIN, 'D' } },       // minimize all windows (can't minimize chrome: it restores)
+};
+
+bool SendCloseCommand(const std::string &sClosingCode) {
+	if (sClosingCode.empty()) return false;
+	auto it = g_closingCodes.find(sClosingCode);
+	if (it != g_closingCodes.end()) {
+		bool bOk = SendKeyCombinationInput(it->second.wVk0, it->second.wVk1);
+		if (!bOk && g_config.uDebugMode) {
+			g_tracker.WriteDataToHistory("Sending " + sClosingCode + " failed.\n");
+		}
+		return bOk;
+	}
+	return false;
+}
+
+uint32_t GetCurrentTaskId() {
 	//!!! this probably should return all non-minimized windows (EnumWindows), not only the active one
 	HWND hWnd = 0;
 	std::wstring sProcessName;
@@ -414,7 +450,7 @@ uint32_t GetCurrentTaskId(const std::vector<SConfig::STask> &tasks) {
 			g_tracker.WriteDataToHistory(FormatDayTime(uTodayMs) + " Current process " + ConvertString16to8(sProcessName) + "; title: " + ConvertString16to8(sTitle) + "\n");
 		}
 
-		for (const SConfig::STask &task : tasks) {
+		for (const SConfig::STask &task : g_config.tasks) {
 			if (task.sProcessName == sProcessName) {
 				if (task.sWindowTitlePart.empty()) {
 					return task.uId;
@@ -437,7 +473,7 @@ uint32_t GetCurrentTaskId(const std::vector<SConfig::STask> &tasks) {
 
 void ProcessTimer()
 {
-	uint32_t uCurrentTaskId = GetCurrentTaskId(g_config.tasks);
+	uint32_t uCurrentTaskId = GetCurrentTaskId();
 
 	uint32_t uTimeMs = 0; // today's time in ms
 	uint32_t uTotalScreenTimeMs = g_tracker.Process(uCurrentTaskId, uTimeMs);
@@ -451,7 +487,7 @@ void ProcessTimer()
 				g_tracker.FlushHistory(false);
 				g_tracker.WriteDataToHistory(FormatDayTime(uTimeMs) + ": Today's screen time limit is reached!\n");
 			}
-			//!!! close the window?
+			SendCloseCommand(GetTask(uCurrentTaskId).sClosingCode);
 		}
 
 		// Evening shutdown
@@ -461,7 +497,7 @@ void ProcessTimer()
 				g_tracker.FlushHistory(false);
 				g_tracker.WriteDataToHistory(FormatDayTime(uTimeMs) + ": It's evening screen time shutdown!\n");
 			}
-			//!!! close the window?
+			SendCloseCommand(GetTask(uCurrentTaskId).sClosingCode);
 		}
 	}
 }
